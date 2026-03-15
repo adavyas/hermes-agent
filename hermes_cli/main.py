@@ -54,16 +54,11 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback
-from dotenv import load_dotenv
-from hermes_cli.config import get_env_path, get_hermes_home
-_user_env = get_env_path()
-if _user_env.exists():
-    try:
-        load_dotenv(dotenv_path=_user_env, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=_user_env, encoding="latin-1")
-load_dotenv(dotenv_path=PROJECT_ROOT / '.env', override=False)
+# Load .env from ~/.hermes/.env first, then project root as dev fallback.
+# User-managed env files should override stale shell exports on restart.
+from hermes_cli.config import get_hermes_home
+from hermes_cli.env_loader import load_hermes_dotenv
+load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
 # Point mini-swe-agent at ~/.hermes/ so it shares our config
 os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(get_hermes_home()))
@@ -3103,7 +3098,11 @@ For more help on a command:
 
         elif action == "export":
             if args.session_id:
-                data = db.export_session(args.session_id)
+                resolved_session_id = db.resolve_session_id(args.session_id)
+                if not resolved_session_id:
+                    print(f"Session '{args.session_id}' not found.")
+                    return
+                data = db.export_session(resolved_session_id)
                 if not data:
                     print(f"Session '{args.session_id}' not found.")
                     return
@@ -3118,13 +3117,17 @@ For more help on a command:
                 print(f"Exported {len(sessions)} sessions to {args.output}")
 
         elif action == "delete":
+            resolved_session_id = db.resolve_session_id(args.session_id)
+            if not resolved_session_id:
+                print(f"Session '{args.session_id}' not found.")
+                return
             if not args.yes:
-                confirm = input(f"Delete session '{args.session_id}' and all its messages? [y/N] ")
+                confirm = input(f"Delete session '{resolved_session_id}' and all its messages? [y/N] ")
                 if confirm.lower() not in ("y", "yes"):
                     print("Cancelled.")
                     return
-            if db.delete_session(args.session_id):
-                print(f"Deleted session '{args.session_id}'.")
+            if db.delete_session(resolved_session_id):
+                print(f"Deleted session '{resolved_session_id}'.")
             else:
                 print(f"Session '{args.session_id}' not found.")
 
@@ -3140,10 +3143,14 @@ For more help on a command:
             print(f"Pruned {count} session(s).")
 
         elif action == "rename":
+            resolved_session_id = db.resolve_session_id(args.session_id)
+            if not resolved_session_id:
+                print(f"Session '{args.session_id}' not found.")
+                return
             title = " ".join(args.title)
             try:
-                if db.set_session_title(args.session_id, title):
-                    print(f"Session '{args.session_id}' renamed to: {title}")
+                if db.set_session_title(resolved_session_id, title):
+                    print(f"Session '{resolved_session_id}' renamed to: {title}")
                 else:
                     print(f"Session '{args.session_id}' not found.")
             except ValueError as e:

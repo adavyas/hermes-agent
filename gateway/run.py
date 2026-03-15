@@ -35,16 +35,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
-# Load environment variables from ~/.hermes/.env first
-from dotenv import load_dotenv
+# Load environment variables from ~/.hermes/.env first.
+# User-managed env files should override stale shell exports on restart.
+from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
+from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
-if _env_path.exists():
-    try:
-        load_dotenv(_env_path, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(_env_path, encoding="latin-1")
-# Also try project .env as fallback
-load_dotenv()
+load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -915,8 +911,19 @@ class GatewayRunner:
         """Stop the gateway and disconnect all adapters."""
         logger.info("Stopping gateway...")
         self._running = False
-        
+
+        for session_key, agent in list(self._running_agents.items()):
+            try:
+                agent.interrupt("Gateway shutting down")
+                logger.debug("Interrupted running agent for session %s during shutdown", session_key[:20])
+            except Exception as e:
+                logger.debug("Failed interrupting agent during shutdown: %s", e)
+
         for platform, adapter in list(self.adapters.items()):
+            try:
+                await adapter.cancel_background_tasks()
+            except Exception as e:
+                logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
             try:
                 await adapter.disconnect()
                 logger.info("✓ %s disconnected", platform.value)
@@ -924,6 +931,9 @@ class GatewayRunner:
                 logger.error("✗ %s disconnect error: %s", platform.value, e)
 
         self.adapters.clear()
+        self._running_agents.clear()
+        self._pending_messages.clear()
+        self._pending_approvals.clear()
         self._shutdown_all_gateway_honcho()
         self._shutdown_event.set()
         
@@ -1110,11 +1120,36 @@ class GatewayRunner:
                         )
             return None
         
-        # PRIORITY: If an agent is already running for this session, interrupt it
-        # immediately. This is before command parsing to minimize latency -- the
-        # user's "stop" message reaches the agent as fast as possible.
+        # PRIORITY handling when an agent is already running for this session.
+        # Default behavior is to interrupt immediately so user text/stop messages
+        # are handled with minimal latency.
+        #
+        # Special case: Telegram/photo bursts often arrive as multiple near-
+        # simultaneous updates. Do NOT interrupt for photo-only follow-ups here;
+        # let the adapter-level batching/queueing logic absorb them.
         _quick_key = build_session_key(source)
         if _quick_key in self._running_agents:
+            if event.message_type == MessageType.PHOTO:
+                logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key[:20])
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    # Reuse adapter queue semantics so photo bursts merge cleanly.
+                    if _quick_key in adapter._pending_messages:
+                        existing = adapter._pending_messages[_quick_key]
+                        if getattr(existing, "message_type", None) == MessageType.PHOTO:
+                            existing.media_urls.extend(event.media_urls)
+                            existing.media_types.extend(event.media_types)
+                            if event.text:
+                                if not existing.text:
+                                    existing.text = event.text
+                                elif event.text not in existing.text:
+                                    existing.text = f"{existing.text}\n\n{event.text}".strip()
+                        else:
+                            adapter._pending_messages[_quick_key] = event
+                    else:
+                        adapter._pending_messages[_quick_key] = event
+                return None
+
             running_agent = self._running_agents[_quick_key]
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
@@ -2413,6 +2448,13 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
+            err_lower = str(e).lower()
+            if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
+                return (
+                    "Voice dependencies are missing (PyNaCl / davey). "
+                    "Install or reinstall Hermes with the messaging extra, e.g. "
+                    "`pip install hermes-agent[messaging]`."
+                )
             return f"Failed to join voice channel: {e}"
 
         if success:
@@ -2553,18 +2595,9 @@ class GatewayRunner:
         if has_agent_tts:
             return False
 
-        # Dedup: base adapter auto-TTS already handles voice input.
-        # Exception: Discord voice channel — play_tts override is a no-op,
-        # so the runner must handle VC playback.
-        skip_double = is_voice_input
-        if skip_double:
-            adapter = self.adapters.get(event.source.platform)
-            guild_id = self._get_guild_id(event)
-            if (guild_id and adapter
-                    and hasattr(adapter, "is_in_voice_channel")
-                    and adapter.is_in_voice_channel(guild_id)):
-                skip_double = False
-        if skip_double:
+        # Dedup: base adapter auto-TTS already handles voice input
+        # (play_tts plays in VC when connected, so runner can skip).
+        if is_voice_input:
             return False
 
         return True
@@ -3488,10 +3521,12 @@ class GatewayRunner:
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
+        if context.source.thread_id:
+            os.environ["HERMES_SESSION_THREAD_ID"] = str(context.source.thread_id)
     
     def _clear_session_env(self) -> None:
         """Clear session environment variables."""
-        for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"]:
+        for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID"]:
             if var in os.environ:
                 del os.environ[var]
     
@@ -3509,9 +3544,13 @@ class GatewayRunner:
           1. Immediately understand what the user sent (no extra tool call).
           2. Re-examine the image with vision_analyze if it needs more detail.
 
+        Athabasca persistence should happen through Athabasca's own POST
+        /api/uploads flow, using the returned asset.publicUrl rather than local
+        cache paths.
+
         Args:
-            user_text:   The user's original caption / message text.
-            image_paths: List of local file paths to cached images.
+            user_text:      The user's original caption / message text.
+            image_paths:    List of local file paths to cached images.
 
         Returns:
             The enriched message string with vision descriptions prepended.
@@ -3536,10 +3575,16 @@ class GatewayRunner:
                 result = _json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
+                    athabasca_note = (
+                        "\n[If this image needs to persist in Athabasca state, upload the cached file "
+                        "through Athabasca POST /api/uploads and use the returned asset.publicUrl. "
+                        "Do not store the local cache path as the canonical imageUrl.]"
+                    )
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
                         f"image_url: {path} ~]"
+                        f"{athabasca_note}"
                     )
                 else:
                     enriched_parts.append(
